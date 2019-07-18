@@ -28,8 +28,7 @@ struct StageHandlerBase {
 
     virtual void next_element() = 0;
 
-    virtual std::unique_ptr<StageHandlerBase>
-    next_stage( std::tuple<range<ContainerIt>...>& ) = 0;
+    virtual void next_stage( std::tuple<range<ContainerIt>...>&, void* ) = 0;
 
     virtual bool operator!=( const StageHandlerBase& other ) const = 0;
 };
@@ -66,7 +65,7 @@ struct StageHandler final : public StageHandlerBase<ValueType, ContainerIt...> {
         }
     }
 
-    std::unique_ptr<BaseType> next_stage( std::tuple<range<ContainerIt>...>& ranges ) override;
+    void next_stage( std::tuple<range<ContainerIt>...>& ranges, void* ptr ) override;
 
     // Member variables
     Range _range;
@@ -76,31 +75,46 @@ struct StageHandler final : public StageHandlerBase<ValueType, ContainerIt...> {
 template < class ValueType, size_t I, bool HasMoreStages, class... ContainerIt >
 struct StageFactory;
 
+// Specialization when stages still remain
 template < class ValueType, size_t I, class... ContainerIt >
 struct StageFactory<ValueType,I,true,ContainerIt...> {
-    std::unique_ptr<StageHandlerBase<ValueType, ContainerIt...>>
-    operator()( std::tuple<range<ContainerIt>...>& ranges ) {
-        return std::make_unique<StageHandler<ValueType, I, ContainerIt...>>( std::get<I>(ranges) );
+    void operator()( std::tuple<range<ContainerIt>...>& ranges, void* ptr ) {
+        new(ptr) StageHandler<ValueType, I, ContainerIt...>( std::get<I>(ranges) );
     }
 };
 
+// Specialization when no more stages are left
 template < class ValueType, size_t I, class... ContainerIt >
 struct StageFactory<ValueType,I,false,ContainerIt...> {
-    std::unique_ptr<StageHandlerBase<ValueType, ContainerIt...>>
-    operator()( std::tuple<range<ContainerIt>...>& ranges ) {
-        // No stages left
-        return nullptr;
+    void operator()( std::tuple<range<ContainerIt>...>& ranges, void* ptr ) {
+        // No stages left. Do nothing.
     }
 };
 
+// This just calls the factory
 template < class ValueType, size_t I, class... ContainerIt >
-std::unique_ptr<StageHandlerBase<ValueType, ContainerIt...>>
-StageHandler<ValueType, I, ContainerIt...>::next_stage( std::tuple<range<ContainerIt>...>& ranges )
+void StageHandler<ValueType, I, ContainerIt...>::next_stage( std::tuple<range<ContainerIt>...>& ranges, void* ptr )
 {
     constexpr bool hasMoreStages = I < sizeof...(ContainerIt)-1;
-    return StageFactory<ValueType, I+1, hasMoreStages, ContainerIt...>()(ranges);
+    StageFactory<ValueType, I+1, hasMoreStages, ContainerIt...>()(ranges, ptr);
 }
 
+// Type trait to define a union
+template < class ValueType, class... ContainerIt >
+struct StageStorage {
+    template < class T >
+    struct Helper;
+
+    template < size_t... Is >
+    struct Helper<std::index_sequence<Is...>> {
+        static_assert( sizeof...(Is) == sizeof...(ContainerIt), "Sequences do not match" );
+        using type = std::aligned_union_t<0, StageHandler<ValueType, Is, ContainerIt...>...>;
+    };
+
+    using type = typename Helper<std::index_sequence_for<ContainerIt...>>::type;
+};
+
+// Wraps multiple ranges into a single instance
 template < class... ContainerIt >
 struct MultiRange {
 public:
@@ -123,6 +137,7 @@ private:
     std::tuple<range<ContainerIt>...> _ranges;
 };
 
+// Iterates over multiple ranges
 template < class... ContainerIt >
 class MultiRange<ContainerIt...>::iterator {
 private:
@@ -150,8 +165,9 @@ public:
     iterator( ranges_tuple& ranges, std::tuple_element_t<I, ranges_tuple> current,
               std::integral_constant<size_t,I> stage ) :
         _ranges( ranges ),
-        _handler( std::make_unique<StageHandler<value_type, I, ContainerIt...>>(current) )
+        _handler()
     {
+        new(&_handler) StageHandler<value_type, I, ContainerIt...>(current);
     }
 
     // Copyable
@@ -166,10 +182,13 @@ public:
 
     // Pre increment
     iterator& operator++() {
-        if( _handler->done() ) {
-            _handler = _handler->next_stage(_ranges);
+        handler_base& handler = get_handler();
+        if( handler.done() ) {
+            // Replace current handler with next stage
+            handler.~handler_base();
+            handler.next_stage(_ranges, &_handler);
         } else {
-            _handler->next_element();
+            handler.next_element();
         }
         return *this;
     }
@@ -183,25 +202,38 @@ public:
 
     // De-reference
     reference_type operator*() {
-        if( _handler->done() )
-            _handler = _handler->next_stage(_ranges);
-        return _handler->get_element();
+        handler_base& handler = get_handler();
+        if( handler.done() ) {
+            // Replace current handler with next stage
+            handler.~handler_base();
+            handler.next_stage(_ranges, &_handler);
+        }
+        return handler.get_element();
     }
 
     // De-reference
     pointer_type operator->() {
-        return &_handler->get_element();
+        return get_handler().get_element();
     }
 
     bool operator!=( const iterator& other ) const {
-        return *_handler != *other._handler;
+        return get_handler() != other.get_handler();
     }
 
 private:
     using handler_base = StageHandlerBase<value_type, ContainerIt...>;
+    using handler_storage = typename StageStorage<value_type, ContainerIt...>::type;
 
-    ranges_tuple&                 _ranges;
-    std::unique_ptr<handler_base> _handler;
+    handler_base& get_handler() {
+        return reinterpret_cast<handler_base&>(_handler);
+    }
+
+    const handler_base& get_handler() const {
+        return reinterpret_cast<const handler_base&>(_handler);
+    }
+
+    ranges_tuple&   _ranges;
+    handler_storage _handler;
 };
 
 template < class... ContainerIt >
